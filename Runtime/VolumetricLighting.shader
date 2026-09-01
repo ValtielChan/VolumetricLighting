@@ -18,6 +18,7 @@ Shader "Hidden/VolumetricLighting"
         float  _VL_Scattering;
         float  _VL_Density;
         float4 _VL_Tint;
+        float2 _VL_BlurTexel;   // one texel of the volumetric buffer, in UV units
 
         #define VL_MAX_SPOTS 8
         int    _VL_SpotCount;
@@ -178,11 +179,41 @@ Shader "Hidden/VolumetricLighting"
             return float4(accum * _VL_Tint.rgb, 1.0);
         }
 
-        // Pass 2 just samples the half-res volumetric and outputs it; the pass uses
-        // hardware additive blending (Blend One One) to composite into camera color.
+        // The raymarch jitter trades banding for per-pixel noise, and this asset has no
+        // temporal filter to resolve it - so a separable gaussian over the volumetric
+        // buffer is what turns that noise back into smooth haze. 9-tap kernel folded
+        // into 5 bilinear fetches; run once per axis.
+        float4 BlurAxis(float2 uv, float2 texelStep)
+        {
+            const float o1 = 1.3846153846;
+            const float o2 = 3.2307692308;
+
+            float3 sum  = SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv).rgb * 0.2270270270;
+            sum += SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv + texelStep * o1).rgb * 0.3162162162;
+            sum += SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv - texelStep * o1).rgb * 0.3162162162;
+            sum += SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv + texelStep * o2).rgb * 0.0702702703;
+            sum += SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv - texelStep * o2).rgb * 0.0702702703;
+            return float4(sum, 1.0);
+        }
+
+        float4 FragBlurH(Varyings input) : SV_Target
+        {
+            UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
+            return BlurAxis(input.texcoord, float2(_VL_BlurTexel.x, 0.0));
+        }
+
+        float4 FragBlurV(Varyings input) : SV_Target
+        {
+            UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
+            return BlurAxis(input.texcoord, float2(0.0, _VL_BlurTexel.y));
+        }
+
+        // Just samples the volumetric buffer and outputs it; the pass uses hardware
+        // additive blending (Blend One One) to composite into camera color.
         float4 FragComposite(Varyings input) : SV_Target
         {
-            return float4(SAMPLE_TEXTURE2D(_BlitTexture, sampler_LinearClamp, input.texcoord).rgb, 1.0);
+            UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
+            return float4(SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, input.texcoord).rgb, 1.0);
         }
         ENDHLSL
 
@@ -206,6 +237,26 @@ Shader "Hidden/VolumetricLighting"
             HLSLPROGRAM
             #pragma vertex Vert
             #pragma fragment FragComposite
+            #pragma target 3.5
+            ENDHLSL
+        }
+
+        Pass
+        {
+            Name "VolumetricBlurH"
+            HLSLPROGRAM
+            #pragma vertex Vert
+            #pragma fragment FragBlurH
+            #pragma target 3.5
+            ENDHLSL
+        }
+
+        Pass
+        {
+            Name "VolumetricBlurV"
+            HLSLPROGRAM
+            #pragma vertex Vert
+            #pragma fragment FragBlurV
             #pragma target 3.5
             ENDHLSL
         }

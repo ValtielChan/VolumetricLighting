@@ -24,6 +24,11 @@ namespace VolumetricLighting
             [Tooltip("Lower = sharper but more expensive. Quarter is the recommended mobile default.")]
             public Resolution resolution = Resolution.Half;
 
+            [Tooltip("Separable gaussian passes over the volumetric buffer before compositing. " +
+                     "This is what removes the raymarch dither: 1 is enough in most scenes, 2 for very " +
+                     "bright spot cones. 0 skips the blur entirely - cheapest, and the dither comes back.")]
+            [Range(0, 3)] public int blurIterations = 1;
+
             [Tooltip("Auto-resolved if left empty.")]
             public Shader shader;
         }
@@ -88,6 +93,12 @@ namespace VolumetricLighting
             private static readonly int SpotPosID      = Shader.PropertyToID("_VL_SpotPos");
             private static readonly int SpotDirID      = Shader.PropertyToID("_VL_SpotDir");
             private static readonly int SpotColorID    = Shader.PropertyToID("_VL_SpotColor");
+            private static readonly int BlurTexelID    = Shader.PropertyToID("_VL_BlurTexel");
+
+            private const int PassRaymarch  = 0;
+            private const int PassComposite = 1;
+            private const int PassBlurH     = 2;
+            private const int PassBlurV     = 3;
 
             private const int MaxSpots = VolumetricSpotLight.MaxActive;
             private readonly Vector4[] _spotPos   = new Vector4[MaxSpots];
@@ -220,12 +231,11 @@ namespace VolumetricLighting
 
                 TextureHandle cameraColor = resourceData.cameraColor;
 
-                // Pass 1 : raymarch into off-screen RT.
+                // Raymarch into the off-screen RT.
                 using (var builder = renderGraph.AddRasterRenderPass<PassData>("Volumetric Raymarch", out var data))
                 {
-                    data.material   = _material;
-                    data.passIndex  = 0;
-                    data.volumetric = volTex;
+                    data.material  = _material;
+                    data.passIndex = PassRaymarch;
 
                     builder.SetRenderAttachment(volTex, 0, AccessFlags.Write);
                     builder.AllowPassCulling(false);
@@ -237,15 +247,40 @@ namespace VolumetricLighting
                     });
                 }
 
-                // Pass 2 : additive composite directly into camera color (no extra fullscreen copy).
-                using (var builder = renderGraph.AddRasterRenderPass<PassData>("Volumetric Composite", out var data))
+                // Separable gaussian: the only thing standing between the jittered raymarch
+                // and visible dither, since there is no temporal filter. Widening happens by
+                // repeating the fixed one-texel kernel - stretching its taps instead would
+                // undersample the kernel itself and alias the dither into a coarser pattern.
+                if (_settings.blurIterations > 0)
+                {
+                    _material.SetVector(BlurTexelID, new Vector4(1f / w, 1f / h, 0f, 0f));
+
+                    var blurDesc = volDesc;
+                    blurDesc.name = "_VL_VolumetricBlur";
+                    blurDesc.clearBuffer = false;
+                    TextureHandle blurTex = renderGraph.CreateTexture(blurDesc);
+
+                    for (int i = 0; i < _settings.blurIterations; i++)
+                    {
+                        AddBlitPass(renderGraph, "Volumetric Blur H", volTex,  blurTex, PassBlurH);
+                        AddBlitPass(renderGraph, "Volumetric Blur V", blurTex, volTex,  PassBlurV);
+                    }
+                }
+
+                // Additive composite directly into camera color (no extra fullscreen copy).
+                AddBlitPass(renderGraph, "Volumetric Composite", volTex, cameraColor, PassComposite);
+            }
+
+            private void AddBlitPass(RenderGraph renderGraph, string name, TextureHandle source, TextureHandle target, int passIndex)
+            {
+                using (var builder = renderGraph.AddRasterRenderPass<PassData>(name, out var data))
                 {
                     data.material   = _material;
-                    data.passIndex  = 1;
-                    data.volumetric = volTex;
+                    data.passIndex  = passIndex;
+                    data.volumetric = source;
 
-                    builder.UseTexture(volTex, AccessFlags.Read);
-                    builder.SetRenderAttachment(cameraColor, 0, AccessFlags.Write);
+                    builder.UseTexture(source, AccessFlags.Read);
+                    builder.SetRenderAttachment(target, 0, AccessFlags.Write);
                     builder.AllowPassCulling(false);
 
                     builder.SetRenderFunc((PassData d, RasterGraphContext ctx) =>
