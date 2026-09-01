@@ -24,9 +24,9 @@ namespace VolumetricLighting
             [Tooltip("Lower = sharper but more expensive. Quarter is the recommended mobile default.")]
             public Resolution resolution = Resolution.Half;
 
-            [Tooltip("Optional separable gaussian over the volumetric buffer, for trading the " +
-                     "raymarch dither against softer shafts. Off by default: raising Steps keeps the " +
-                     "image sharp, which is usually what you want. 1-2 if you need smooth on a step budget.")]
+            [Tooltip("Optional separable gaussian over the volumetric buffer, for trading grain in " +
+                     "the sun shafts against softer shafts. Off by default: raising Steps keeps the " +
+                     "image sharp, which is usually what you want. Spot cones do not need it.")]
             [Range(0, 3)] public int blurIterations = 0;
 
             [Tooltip("Auto-resolved if left empty.")]

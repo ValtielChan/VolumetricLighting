@@ -10,24 +10,12 @@ through the air.
 
 <p align="center">
   <img src="Documentation/images/shafts-angle.png" width="49%" alt="Shafts seen from inside the colonnade">
-  <img src="Documentation/images/denoise-on.png" width="49%" alt="Volumetric spot lights at night, sun disabled">
+  <img src="Documentation/images/spot-lights.png" width="49%" alt="Volumetric spot lights at night, sun disabled">
 </p>
 
 <sub>The demo scene (`Samples/Demo.unity`) at 1600×900, Full resolution,
 no blur. Right: the same scene with the sun turned off — only the three
 `VolumetricSpotLight` cones remain.</sub>
-
-## Blur off / on (optional)
-
-<p align="center">
-  <img src="Documentation/images/denoise-off.png" width="49%" alt="Blur Iterations 0 - the raymarch jitter shows as dither">
-  <img src="Documentation/images/denoise-on.png" width="49%" alt="Blur Iterations 1 - smooth cones">
-</p>
-
-<sub>`Blur Iterations` 0 (the default) and 1. The blur is a trade, not an
-upgrade: it buys smooth cones on a small step budget and costs you crisp shaft
-edges. Raising `Steps` gets you smooth *and* sharp — see
-[The dither](#the-dither).</sub>
 
 ## Same frame, effect off / on
 
@@ -71,8 +59,8 @@ renderer features live on the render pipeline asset rather than in the scene.
 |---|---|
 | `Enabled` | Master switch. Off = the pass is never enqueued, zero cost. |
 | `Intensity` | Scattering multiplier for the **main directional light**. `0` skips the sun path (and its shadow sample) entirely — set it to 0 at night. |
-| `Steps` | Raymarch samples per pixel. **16–24** mobile, **32–48** desktop. |
-| `Max Distance` | How far the ray marches, in meters. Keep it near the size of what the camera actually sees: a large value spreads the same step count over more distance and coarsens the result. |
+| `Steps` | Samples per pixel for the **sun** march, and the budget the spot integration scales itself from. **16–24** mobile, **32–48** desktop, more only if the sun shafts still grain. |
+| `Max Distance` | How far the ray marches, in meters, and how far the fog reaches. It coarsens the **sun** march when you push it out; the spot cones are unaffected. |
 | `Scattering` | Henyey-Greenstein anisotropy. Positive = forward scattering, the classic bright halo around the sun. |
 | `Density` | Scattering coefficient of the medium — "how much fog". |
 | `Tint` | HDR tint applied to every contribution. |
@@ -88,7 +76,7 @@ desktop starting point.
 |---|---|
 | `Injection Point` | When the pass runs. Default `BeforeRenderingTransparents`, so transparents composite over the fog. |
 | `Resolution` | Raymarch buffer size: `Full`, `Half`, `Quarter`. **Quarter** is the mobile default, `Full` for stills and desktop. |
-| `Blur Iterations` | Optional separable gaussian passes over the volumetric buffer. **0** (default) keeps the shafts crisp. **1–2** trades that crispness for smooth cones when you cannot afford the `Steps` that would do it properly. |
+| `Blur Iterations` | Optional separable gaussian passes over the volumetric buffer. **0** (default) keeps the shafts crisp. **1–2** trades that crispness against sun-shaft grain when you cannot afford the `Steps` that would remove it properly. |
 | `Shader` | Auto-resolved to `Hidden/VolumetricLighting`; leave it empty. |
 
 ### Presets that work
@@ -100,21 +88,28 @@ desktop starting point.
 | **PC / stills** | Full | 0 | 96–128 | 40–50 m |
 
 `Resolution` changes how *coarse* the fog is, never how sharp the frame is:
-the composite is depth-aware, so silhouettes stay crisp at Quarter. Pick it
-on your frame budget alone.
+the composite is depth-aware, so silhouettes stay crisp at Quarter. Pick it on
+your frame budget alone. `Max Distance` is a look choice, not a quality one —
+push it as far as the scene needs.
 
 ## How it works
 
 Recorded on the Render Graph:
 
 1. **Raymarch** into an off-screen `R16G16B16A16_SFloat` target at the chosen
-   resolution. For each pixel the scene depth gives the ray's end point (the
-   sky clamps to `Max Distance`), and the ray is marched with an
-   interleaved-gradient-noise jitter to break up banding. At each step the
-   directional light's **cascade shadow map is sampled directly** — not the
-   screen-space shadow texture, which is meaningless for a point floating in
-   mid-air — and every registered spot light is accumulated analytically.
-   The loop early-outs once transmittance drops below 1%.
+   resolution. The two light types are integrated separately, because they need
+   very different things:
+   - The **sun** is marched along the whole ray, `Steps` samples with an
+     interleaved-gradient-noise jitter. It has to be walked because its
+     occlusion comes from the **cascade shadow map, sampled directly** — not
+     the screen-space shadow texture, which is meaningless for a point floating
+     in mid-air. The loop early-outs once transmittance drops below 1%, and is
+     skipped entirely when `Intensity` is 0.
+   - Each **spot light** is integrated over its own slice of the ray: the
+     ray/cone intersection gives the interval where that light can reach, and
+     the samples go there instead of being spread over `Max Distance`. Pixels
+     outside every cone cost nothing at all. The medium is homogeneous, so
+     transmittance is closed-form and each light can be integrated on its own.
 2. **Blur**, `Blur Iterations` times (0 by default, so usually skipped): a
    9-tap gaussian folded into 5 bilinear fetches, horizontal then vertical,
    over the volumetric buffer only.
@@ -138,50 +133,40 @@ writing camera colour — silently does nothing.
 
 ## The dither
 
-Marching a fixed number of steps through a light shaft quantises it into
-bands. The raymarch offsets each pixel's first sample by a noise pattern to
-trade those bands for noise, on the usual assumption that something
-downstream resolves it. Nothing does here, so you see the noise — and since
-the pattern is interleaved gradient noise it reads as a regular dither rather
-than as grain. Plenty of people like it; it is not a bug you have to remove.
+Marching a fixed number of steps through a light shaft quantises it into bands.
+The sun march offsets each pixel's first sample by a noise pattern to trade
+those bands for noise, which is cheaper than the step count it would take to
+remove either — so at low `Steps` you will see grain in the sun shafts. That
+part is a deliberate trade, and plenty of people like the look.
 
-It appears **where one step is too coarse for how fast the light changes over
-it**, which is why it lands on spot cones and not on broad sun shafts: close
-to the bulb, the whole cone profile can be narrower than a single step.
+**Spot cones no longer dither at any setting.** They used to, badly, and the
+reason is worth knowing if you extend this: they were sampled along the shared
+camera ray, so their sample density was set by `Max Distance`. With the fog
+reaching 127 m, a cone a few metres across got two or three samples and the
+jitter turned that into a visible pattern — and raising `Steps` barely helped,
+because the extra samples went mostly into empty distance. Each spot is now
+integrated over the interval where its own cone actually is, so a crossing gets
+the same sample count whether the fog reaches 30 m or 300 m.
 
-So the number that governs it is the **step length**:
-
-```
-step length = Max Distance / Steps
-```
-
-Around **1 m** the cones dither. Around **0.35 m** they are smooth, and only
-the last metre before each bulb still shows anything. In the demo scene that
-is 128 steps over 45 m. Lowering `Max Distance` is usually the cheaper half of
-that trade — marching 127 m through a 40 m room spends most of the budget on
-nothing.
-
-`Blur Iterations` is the fallback when you cannot afford those steps: one
-separable gaussian over the volumetric buffer. It works, and it costs shaft
-crispness — which is why it is off by default.
-
-Two things worth knowing if you do turn it on:
-
-- Widening happens by **repeating** the kernel, not by stretching its taps.
-  Spreading a 5-tap gaussian over more texels undersamples the kernel itself
-  and aliases the dither into a coarser, more visible pattern.
-- The blur is not depth-aware (only the upsample is), so at Half or Quarter it
-  can pull a little fog past a silhouette.
+If you do want to trade sun-shaft grain for softness on a small step budget,
+`Blur Iterations` on the renderer feature is one separable gaussian over the
+volumetric buffer. It is off by default because it costs shaft crispness, and
+because raising `Steps` is usually the better answer. Two things if you turn it
+on: widening happens by **repeating** the kernel, not by stretching its taps
+(stretching undersamples the kernel and aliases the grain into a coarser
+pattern), and the blur is not depth-aware — only the upsample is — so at Half
+or Quarter it can pull a little fog past a silhouette.
 
 ## Mobile guidance
 
 - Renderer feature resolution → **Quarter**. Edges stay sharp there; only the
   fog itself gets coarser.
-- `Steps` 16–24, `Density` 0.1–0.3, `Max Distance` 30–40 m — keep
-  `Max Distance` tight, it is what makes low step counts usable.
+- `Steps` 16–24, `Density` 0.1–0.3. `Max Distance` is free to be whatever the
+  scene wants; it only affects how far the sun march has to reach.
 - Keep 2–4 `VolumetricSpotLight` visible at once.
-- Set `Intensity` to 0 whenever the sun is not the story: it removes the
-  shadow-map sample from the inner loop, which is the expensive part.
+- Set `Intensity` to 0 whenever the sun is not the story: the whole sun march,
+  shadow sampling included, is then skipped and only the spot cones are
+  integrated.
 
 ## Limits
 

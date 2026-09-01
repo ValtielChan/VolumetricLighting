@@ -56,50 +56,158 @@ Shader "Hidden/VolumetricLighting"
         #endif
         }
 
-        // Accumulated in-scattering from all registered spot lights at world position p.
-        // rayDir is the camera->sample direction (used for the phase function).
-        float3 AccumulateSpots(float3 p, float3 rayDir, float g, float sigmaS)
+        // Conservative t-interval where the ray can be inside a spot cone, clipped to
+        // the light range and to the ray itself. Samples are still cone-tested one by
+        // one, so this only has to bracket the crossing - it never has to be exact,
+        // which is what lets it stay branch-simple for every orientation of the cone.
+        bool SpotInterval(float3 camPos, float3 rayDir, float marchLen,
+                          float3 spotPos, float3 spotFwd, float cosOuter, float range,
+                          out float t0, out float t1)
+        {
+            t0 = 0.0;
+            t1 = 0.0;
+
+            float3 w  = camPos - spotPos;
+            float  wv = dot(w, rayDir);
+            float  ww = dot(w, w);
+
+            // Range sphere: everything the light can reach is inside it.
+            float disc = wv * wv - (ww - range * range);
+            if (disc <= 0.0) return false;
+            float sq = sqrt(disc);
+            float s0 = max(-wv - sq, 0.0);
+            float s1 = min(-wv + sq, marchLen);
+            if (s1 <= s0) return false;
+
+            // Cone quadratic. Its roots are where the ray crosses the cone surface, so
+            // they cut [s0,s1] into pieces that are each wholly inside or wholly outside.
+            float cos2 = cosOuter * cosOuter;
+            float dv   = dot(spotFwd, rayDir);
+            float dw   = dot(spotFwd, w);
+            float a    = dv * dv - cos2;
+            float b    = 2.0 * (dw * dv - cos2 * wv);
+            float c    = dw * dw - cos2 * ww;
+
+            float r0 = s0;
+            float r1 = s1;
+            if (abs(a) > 1e-6)
+            {
+                float cdisc = b * b - 4.0 * a * c;
+                if (cdisc > 0.0)
+                {
+                    float csq = sqrt(cdisc);
+                    float inv = 0.5 / a;
+                    float x0  = (-b - csq) * inv;
+                    float x1  = (-b + csq) * inv;
+                    r0 = min(x0, x1);
+                    r1 = max(x0, x1);
+                }
+            }
+            else if (abs(b) > 1e-8)
+            {
+                r0 = -c / b;
+            }
+
+            float bounds[4];
+            bounds[0] = s0;
+            bounds[1] = clamp(r0, s0, s1);
+            bounds[2] = clamp(r1, s0, s1);
+            bounds[3] = s1;
+
+            // Keep the union of the pieces whose midpoint really is in the cone. The
+            // union is conservative when a ray clips two lobes; a few wasted samples
+            // cost nothing, a wrong interval would cost the whole shaft.
+            float lo =  1e30;
+            float hi = -1e30;
+            [unroll]
+            for (int k = 0; k < 3; k++)
+            {
+                float lb = bounds[k];
+                float ub = bounds[k + 1];
+                if (ub <= lb) continue;
+
+                float3 x   = w + rayDir * (0.5 * (lb + ub));
+                float  len = length(x);
+                if (len > 1e-5 && dot(x, spotFwd) >= cosOuter * len)
+                {
+                    lo = min(lo, lb);
+                    hi = max(hi, ub);
+                }
+            }
+
+            if (hi <= lo) return false;
+            t0 = lo;
+            t1 = hi;
+            return true;
+        }
+
+        // In-scattering from the registered spot lights, integrated per light over the
+        // slice of the ray that light can actually reach.
+        //
+        // Marching the spots along the shared camera ray tied their sample density to
+        // Max Distance: with the fog reaching far, a cone a few metres wide got two or
+        // three samples and the raymarch jitter turned that into the dither. Here every
+        // crossing gets the same sample count however far the fog reaches - and pixels
+        // outside every cone cost nothing instead of one evaluation per step.
+        //
+        // The medium is homogeneous, so transmittance is closed-form and each light can
+        // be integrated on its own without walking the ray from the camera.
+        float3 IntegrateSpots(float3 camPos, float3 rayDir, float marchLen,
+                              float g, float sigmaS, float sigmaE, float jitter)
         {
         #if defined(_VL_SPOTS_ON)
+            int spotSteps = clamp((int)_VL_Steps / 2, 8, 48);
             float3 sum = 0;
             int count = min(_VL_SpotCount, VL_MAX_SPOTS);
+
             [loop]
             for (int s = 0; s < count; s++)
             {
-                float3 spotPos   = _VL_SpotPos[s].xyz;
-                float  invRange  = _VL_SpotPos[s].w;
-                float3 spotFwd   = _VL_SpotDir[s].xyz;
-                float  cosOuter  = _VL_SpotDir[s].w;
-                float3 spotCol   = _VL_SpotColor[s].rgb;
-                float  cosInner  = _VL_SpotColor[s].w;
+                float3 spotPos  = _VL_SpotPos[s].xyz;
+                float  invRange = _VL_SpotPos[s].w;
+                float3 spotFwd  = _VL_SpotDir[s].xyz;
+                float  cosOuter = _VL_SpotDir[s].w;
+                float3 spotCol  = _VL_SpotColor[s].rgb;
+                float  cosInner = _VL_SpotColor[s].w;
 
-                float3 toLight = spotPos - p;
-                float dist2 = dot(toLight, toLight);
-                float dist  = sqrt(max(dist2, 1e-8));
-                float3 L = toLight / dist; // from sample toward light
+                float range = 1.0 / max(invRange, 1e-6);
+                float t0, t1;
+                if (!SpotInterval(camPos, rayDir, marchLen, spotPos, spotFwd, cosOuter, range, t0, t1))
+                    continue;
 
-                // Cheap rejection: out of range.
-                if (dist * invRange >= 1.0) continue;
+                float dt = (t1 - t0) / spotSteps;
 
-                // Distance attenuation matching URP's smooth-windowed inverse-square.
-                float distRange = dist * invRange;
-                float window = saturate(1.0 - distRange * distRange * distRange * distRange);
-                window *= window;
-                // Treat the spot as a small sphere rather than a point: an unclamped
-                // 1/d^2 explodes where the ray passes next to the bulb and the raymarch
-                // jitter turns that spike into visible dither.
-                float distAtt = window / max(dist2, 0.25);
+                [loop]
+                for (int i = 0; i < spotSteps; i++)
+                {
+                    float  t = t0 + (i + jitter) * dt;
+                    float3 p = camPos + rayDir * t;
 
-                // Spot cone: angle between light-forward and the vector from light to sample.
-                float cosAng = dot(-L, spotFwd);
-                if (cosAng <= cosOuter) continue;
+                    float3 toLight = spotPos - p;
+                    float dist2 = dot(toLight, toLight);
+                    float dist  = sqrt(max(dist2, 1e-8));
+                    float3 L = toLight / dist; // from sample toward light
 
-                float coneAtt = saturate((cosAng - cosOuter) / max(cosInner - cosOuter, 1e-4));
-                coneAtt *= coneAtt; // soften edge
+                    float distRange = dist * invRange;
+                    if (distRange >= 1.0) continue;
 
-                float att = distAtt * coneAtt;
-                float phase = HenyeyGreenstein(dot(rayDir, L), g);
-                sum += spotCol * phase * att * sigmaS;
+                    // Distance attenuation matching URP smooth-windowed inverse-square.
+                    float window = saturate(1.0 - distRange * distRange * distRange * distRange);
+                    window *= window;
+                    // Treat the spot as a small sphere rather than a point: an unclamped
+                    // 1/d^2 explodes where the ray passes next to the bulb.
+                    float distAtt = window / max(dist2, 0.25);
+
+                    // Spot cone: angle between light-forward and the vector from light to sample.
+                    float cosAng = dot(-L, spotFwd);
+                    if (cosAng <= cosOuter) continue;
+
+                    float coneAtt = saturate((cosAng - cosOuter) / max(cosInner - cosOuter, 1e-4));
+                    coneAtt *= coneAtt; // soften edge
+
+                    float phase = HenyeyGreenstein(dot(rayDir, L), g);
+                    sum += spotCol * phase * distAtt * coneAtt * sigmaS * exp(-sigmaE * t) * dt;
+                }
             }
             return sum;
         #else
@@ -151,28 +259,30 @@ Shader "Hidden/VolumetricLighting"
             bool hasSun = dot(lightColor, float3(1,1,1)) > 1e-4 && _VL_Intensity > 0.0;
 
             float3 accum = 0;
-            float transmittance = 1.0;
 
-            [loop]
-            for (int i = 0; i < steps; i++)
+            // The sun is the only term that needs walking the whole ray: its occlusion
+            // comes from the shadow cascades and can change at any point along it.
+            if (hasSun)
             {
-                float t = (i + jitter) * stepSize;
-                if (t > marchLen) break;
+                float transmittance = 1.0;
 
-                float3 p = camPos + rayDir * t;
-
-                float3 scatter = 0;
-                if (hasSun)
+                [loop]
+                for (int i = 0; i < steps; i++)
                 {
-                    float shadow = SampleSunShadow(p);
-                    scatter += lightColor * phase * shadow * sigmaS * _VL_Intensity;
-                }
-                scatter += AccumulateSpots(p, rayDir, _VL_Scattering, sigmaS);
-                accum += scatter * transmittance * stepSize;
+                    float t = (i + jitter) * stepSize;
+                    if (t > marchLen) break;
 
-                transmittance *= exp(-sigmaE * stepSize);
-                if (transmittance < 0.01) break;
+                    float3 p = camPos + rayDir * t;
+
+                    float shadow = SampleSunShadow(p);
+                    accum += lightColor * phase * shadow * sigmaS * _VL_Intensity * transmittance * stepSize;
+
+                    transmittance *= exp(-sigmaE * stepSize);
+                    if (transmittance < 0.01) break;
+                }
             }
+
+            accum += IntegrateSpots(camPos, rayDir, marchLen, _VL_Scattering, sigmaS, sigmaE, jitter);
 
             // Tint applies to both directional and spot scattering.
             // Spot contributions are already scaled by per-light intensity * global spotIntensity on the CPU.
