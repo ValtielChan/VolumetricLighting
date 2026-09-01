@@ -18,7 +18,7 @@ Shader "Hidden/VolumetricLighting"
         float  _VL_Scattering;
         float  _VL_Density;
         float4 _VL_Tint;
-        float2 _VL_BlurTexel;   // one texel of the volumetric buffer, in UV units
+        float2 _VL_VolumetricTexel;   // one texel of the volumetric buffer, in UV units
 
         #define VL_MAX_SPOTS 8
         int    _VL_SpotCount;
@@ -176,7 +176,9 @@ Shader "Hidden/VolumetricLighting"
 
             // Tint applies to both directional and spot scattering.
             // Spot contributions are already scaled by per-light intensity * global spotIntensity on the CPU.
-            return float4(accum * _VL_Tint.rgb, 1.0);
+            // Alpha carries the scene depth this pixel was marched against, so the
+            // composite can tell which low-resolution texels belong to which surface.
+            return float4(accum * _VL_Tint.rgb, LinearEyeDepth(rawDepth, _ZBufferParams));
         }
 
         // The raymarch jitter trades banding for per-pixel noise, and this asset has no
@@ -188,32 +190,76 @@ Shader "Hidden/VolumetricLighting"
             const float o1 = 1.3846153846;
             const float o2 = 3.2307692308;
 
-            float3 sum  = SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv).rgb * 0.2270270270;
+            // Only colour is blurred: alpha holds the depth the composite needs to keep
+            // the fog off the wrong side of a silhouette, and smearing it would defeat that.
+            float4 center = SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv);
+
+            float3 sum  = center.rgb * 0.2270270270;
             sum += SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv + texelStep * o1).rgb * 0.3162162162;
             sum += SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv - texelStep * o1).rgb * 0.3162162162;
             sum += SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv + texelStep * o2).rgb * 0.0702702703;
             sum += SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv - texelStep * o2).rgb * 0.0702702703;
-            return float4(sum, 1.0);
+            return float4(sum, center.a);
         }
 
         float4 FragBlurH(Varyings input) : SV_Target
         {
             UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
-            return BlurAxis(input.texcoord, float2(_VL_BlurTexel.x, 0.0));
+            return BlurAxis(input.texcoord, float2(_VL_VolumetricTexel.x, 0.0));
         }
 
         float4 FragBlurV(Varyings input) : SV_Target
         {
             UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
-            return BlurAxis(input.texcoord, float2(0.0, _VL_BlurTexel.y));
+            return BlurAxis(input.texcoord, float2(0.0, _VL_VolumetricTexel.y));
         }
 
-        // Just samples the volumetric buffer and outputs it; the pass uses hardware
-        // additive blending (Blend One One) to composite into camera color.
+        // Depth-aware upsample, then hardware additive blending (Blend One One) into
+        // camera color. A plain bilinear read of a Half/Quarter buffer smears the fog a
+        // full low-res texel past every silhouette, which is what made low resolutions
+        // look soft and blocky rather than just coarse. Each texel remembers the scene
+        // depth it was marched against, so taps belonging to another surface are
+        // rejected and the fog ends exactly on the geometry edge.
         float4 FragComposite(Varyings input) : SV_Target
         {
             UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
-            return float4(SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, input.texcoord).rgb, 1.0);
+
+            float2 uv    = input.texcoord;
+            float2 texel = _VL_VolumetricTexel;
+            float  depth = LinearEyeDepth(SampleSceneDepth(uv), _ZBufferParams);
+
+            // The four volumetric texels this pixel sits between, and their bilinear weights.
+            float2 coord = uv / texel - 0.5;
+            float2 baseC = floor(coord);
+            float2 f     = coord - baseC;
+
+            float2 bw = float2(1.0 - f.x, f.x);
+            float2 bh = float2(1.0 - f.y, f.y);
+
+            float3 sum  = 0.0;
+            float  wsum = 0.0;
+
+            [unroll]
+            for (int y = 0; y < 2; y++)
+            {
+                [unroll]
+                for (int x = 0; x < 2; x++)
+                {
+                    float2 tapUV = (baseC + float2(x, y) + 0.5) * texel;
+                    float4 tap   = SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_PointClamp, tapUV);
+
+                    // Relative depth difference, so the rejection behaves the same up close
+                    // and far away. The 1e-3 floor keeps this a plain bilinear read when
+                    // every tap disagrees (and when the buffer is already full resolution).
+                    float diff = abs(tap.a - depth) / max(depth, 1e-4);
+                    float w    = bw[x] * bh[y] * (exp2(-diff * 64.0) + 1e-3);
+
+                    sum  += tap.rgb * w;
+                    wsum += w;
+                }
+            }
+
+            return float4(sum / max(wsum, 1e-6), 1.0);
         }
         ENDHLSL
 

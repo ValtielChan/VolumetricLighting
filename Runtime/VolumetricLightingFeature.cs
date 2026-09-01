@@ -24,10 +24,10 @@ namespace VolumetricLighting
             [Tooltip("Lower = sharper but more expensive. Quarter is the recommended mobile default.")]
             public Resolution resolution = Resolution.Half;
 
-            [Tooltip("Separable gaussian passes over the volumetric buffer before compositing. " +
-                     "This is what removes the raymarch dither: 1 is enough in most scenes, 2 for very " +
-                     "bright spot cones. 0 skips the blur entirely - cheapest, and the dither comes back.")]
-            [Range(0, 3)] public int blurIterations = 1;
+            [Tooltip("Optional separable gaussian over the volumetric buffer, for trading the " +
+                     "raymarch dither against softer shafts. Off by default: raising Steps keeps the " +
+                     "image sharp, which is usually what you want. 1-2 if you need smooth on a step budget.")]
+            [Range(0, 3)] public int blurIterations = 0;
 
             [Tooltip("Auto-resolved if left empty.")]
             public Shader shader;
@@ -93,7 +93,7 @@ namespace VolumetricLighting
             private static readonly int SpotPosID      = Shader.PropertyToID("_VL_SpotPos");
             private static readonly int SpotDirID      = Shader.PropertyToID("_VL_SpotDir");
             private static readonly int SpotColorID    = Shader.PropertyToID("_VL_SpotColor");
-            private static readonly int BlurTexelID    = Shader.PropertyToID("_VL_BlurTexel");
+            private static readonly int VolTexelID     = Shader.PropertyToID("_VL_VolumetricTexel");
 
             private const int PassRaymarch  = 0;
             private const int PassComposite = 1;
@@ -229,7 +229,11 @@ namespace VolumetricLighting
                 };
                 TextureHandle volTex = renderGraph.CreateTexture(volDesc);
 
+                // Both the blur and the depth-aware composite work in volumetric texels.
+                _material.SetVector(VolTexelID, new Vector4(1f / w, 1f / h, 0f, 0f));
+
                 TextureHandle cameraColor = resourceData.cameraColor;
+                TextureHandle cameraDepth = resourceData.cameraDepthTexture;
 
                 // Raymarch into the off-screen RT.
                 using (var builder = renderGraph.AddRasterRenderPass<PassData>("Volumetric Raymarch", out var data))
@@ -238,6 +242,7 @@ namespace VolumetricLighting
                     data.passIndex = PassRaymarch;
 
                     builder.SetRenderAttachment(volTex, 0, AccessFlags.Write);
+                    if (cameraDepth.IsValid()) builder.UseTexture(cameraDepth, AccessFlags.Read);
                     builder.AllowPassCulling(false);
                     builder.AllowGlobalStateModification(true);
 
@@ -253,8 +258,6 @@ namespace VolumetricLighting
                 // undersample the kernel itself and alias the dither into a coarser pattern.
                 if (_settings.blurIterations > 0)
                 {
-                    _material.SetVector(BlurTexelID, new Vector4(1f / w, 1f / h, 0f, 0f));
-
                     var blurDesc = volDesc;
                     blurDesc.name = "_VL_VolumetricBlur";
                     blurDesc.clearBuffer = false;
@@ -267,11 +270,11 @@ namespace VolumetricLighting
                     }
                 }
 
-                // Additive composite directly into camera color (no extra fullscreen copy).
-                AddBlitPass(renderGraph, "Volumetric Composite", volTex, cameraColor, PassComposite);
+                // Depth-aware upsample + additive composite, straight into camera color.
+                AddBlitPass(renderGraph, "Volumetric Composite", volTex, cameraColor, PassComposite, cameraDepth);
             }
 
-            private void AddBlitPass(RenderGraph renderGraph, string name, TextureHandle source, TextureHandle target, int passIndex)
+            private void AddBlitPass(RenderGraph renderGraph, string name, TextureHandle source, TextureHandle target, int passIndex, TextureHandle depth = default)
             {
                 using (var builder = renderGraph.AddRasterRenderPass<PassData>(name, out var data))
                 {
@@ -280,6 +283,7 @@ namespace VolumetricLighting
                     data.volumetric = source;
 
                     builder.UseTexture(source, AccessFlags.Read);
+                    if (depth.IsValid()) builder.UseTexture(depth, AccessFlags.Read);
                     builder.SetRenderAttachment(target, 0, AccessFlags.Write);
                     builder.AllowPassCulling(false);
 
