@@ -17,6 +17,18 @@ through the air.
 no blur. Right: the same scene with the sun turned off — only the three
 `VolumetricSpotLight` cones remain.</sub>
 
+## In motion
+
+<p align="center">
+  <img src="Documentation/images/sun-sweep.gif" width="49%" alt="The sun swinging, shafts and shadows sweeping across the floor">
+  <img src="Documentation/images/sun-intensity.gif" width="49%" alt="Sun Intensity ramped from 0 to 1">
+</p>
+
+<sub>Left: the sun rotating. The shafts are read from the cascade shadow map
+every frame, so they sweep with it — nothing is baked. Right: the same frame
+with `Intensity` ramped from `0` to `1`; at `0` the sun march is skipped
+entirely and only the three spot cones are left.</sub>
+
 ## Same frame, effect off / on
 
 <p align="center">
