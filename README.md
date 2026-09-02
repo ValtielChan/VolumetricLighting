@@ -48,9 +48,11 @@ override. Geometry, materials and light setup are identical.</sub>
 
 ## Install
 
-Copy the `Volumetric Lighting` folder into your project's `Assets/`. That's
-the whole asset — two assembly definitions, one shader, no dependencies
-beyond URP itself.
+Grab the `.unitypackage` from
+[Releases](https://github.com/ValtielChan/VolumetricLighting/releases), or copy
+the `Volumetric Lighting` folder into your project's `Assets/`. That's the whole
+asset — two assembly definitions, one shader, no dependencies beyond URP
+itself.
 
 ## Setup
 
